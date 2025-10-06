@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Shield, CheckCircle, X, Clock, User, Trophy, Calendar, RotateCcw,
-  ChevronDown, ChevronUp, Search
+  ChevronDown, ChevronUp, Search, Undo
 } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../context/AuthContext';
@@ -21,6 +21,17 @@ interface ClaimRequest {
   revoked_at?: string;
   revoked_by?: string;
   original_player_name?: string;
+}
+
+interface ClaimHistory {
+  id: string;
+  claim_request_id: string;
+  action_type: string;
+  performed_by: string;
+  performed_at: string;
+  affected_records: any;
+  previous_state: any;
+  can_undo: boolean;
 }
 
 export function ClaimRequests() {
@@ -53,6 +64,10 @@ export function ClaimRequests() {
   const [creatingProxy, setCreatingProxy] = useState(false);
   const [proxyNameInput, setProxyNameInput] = useState('');
   const [proxyCreatedInfo, setProxyCreatedInfo] = useState<any | null>(null);
+
+  // Undo history states
+  const [claimHistories, setClaimHistories] = useState<Record<string, ClaimHistory[]>>({});
+  const [loadingHistory, setLoadingHistory] = useState<Record<string, boolean>>({});
 
   const isAdmin = user?.role === 'admin' || user?.role === 'developer';
 
@@ -101,6 +116,30 @@ export function ClaimRequests() {
       console.error('Error fetching claim requests:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const fetchClaimHistory = async (requestId: string) => {
+    if (claimHistories[requestId]) return;
+
+    setLoadingHistory(prev => ({ ...prev, [requestId]: true }));
+    try {
+      const { data, error } = await supabase
+        .from('claim_history')
+        .select('*')
+        .eq('claim_request_id', requestId)
+        .order('performed_at', { ascending: false });
+
+      if (error) throw error;
+
+      setClaimHistories(prev => ({
+        ...prev,
+        [requestId]: data || []
+      }));
+    } catch (err) {
+      console.error('Error fetching claim history:', err);
+    } finally {
+      setLoadingHistory(prev => ({ ...prev, [requestId]: false }));
     }
   };
 
@@ -363,22 +402,20 @@ export function ClaimRequests() {
   const handleRevokeClaim = async (request: ClaimRequest) => {
     const confirmed = await confirm(
       'Revoke Claim',
-      `Are you sure you want to revoke this claim for "${request.target_player_name}" merged into "${request.requesting_username}"? This will attempt to reverse the stats transfer.`
+      `Are you sure you want to revoke this claim for "${request.target_player_name}" merged into "${request.requesting_username}"? This will restore the original player name "${request.original_player_name || request.target_player_name}".`
     );
-  
+
     if (!confirmed) return;
-  
+
     try {
-      // 1. Call RPC to reverse the merge
       const { data: revokeResult, error: revokeError } = await supabase.rpc('revoke_claimed_stats', {
         p_request_id: request.id
       });
-  
+
       if (revokeError) throw revokeError;
       if (!revokeResult?.success)
         throw new Error(revokeResult?.error || 'RPC returned failure');
-  
-      // 2. Update claim record status
+
       const { error: updateError } = await supabase
         .from('stat_claim_requests')
         .update({
@@ -387,14 +424,54 @@ export function ClaimRequests() {
           revoked_by: user?.username
         })
         .eq('id', request.id);
-  
+
       if (updateError) throw updateError;
-  
-      await alert('Claim Revoked', `Reversed ${revokeResult.affected_matches} matches. The claim has been marked as revoked.`);
+
+      await alert('Claim Revoked', `Successfully revoked! Restored ${revokeResult.affected_matches} matches to "${revokeResult.restored_name}".`);
+      setClaimHistories(prev => {
+        const newHistories = { ...prev };
+        delete newHistories[request.id];
+        return newHistories;
+      });
       await fetchAllClaimRequests();
     } catch (err) {
       console.error('Error revoking claim:', err);
       await alert('Error', `Failed to revoke claim: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
+    }
+  };
+
+  // -------------------------
+  // Undo any claim action
+  // -------------------------
+  const handleUndoAction = async (historyId: string, actionType: string, requestId: string) => {
+    const actionName = actionType === 'claim' ? 'merge' : actionType;
+    const confirmed = await confirm(
+      'Undo Action',
+      `Are you sure you want to undo this ${actionName}? This will restore the previous state.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      const { data: undoResult, error: undoError } = await supabase.rpc('undo_claim_action', {
+        p_history_id: historyId
+      });
+
+      if (undoError) throw undoError;
+      if (!undoResult?.success)
+        throw new Error(undoResult?.error || 'Failed to undo action');
+
+      await alert('Action Undone', `Successfully undid ${actionName}. Affected ${undoResult.affected_matches} matches.`);
+
+      setClaimHistories(prev => {
+        const newHistories = { ...prev };
+        delete newHistories[requestId];
+        return newHistories;
+      });
+      await fetchAllClaimRequests();
+    } catch (err) {
+      console.error('Error undoing action:', err);
+      await alert('Error', `Failed to undo action: ${err instanceof Error ? err.message : JSON.stringify(err)}`);
     }
   };
 
@@ -698,17 +775,100 @@ export function ClaimRequests() {
                       }`}>
                         <span className="text-sm font-medium uppercase">{request.status}</span>
                       </div>
-                        {isAdmin && request.status === 'completed' && (
+                      {isAdmin && (request.status === 'completed' || request.status === 'revoked') && (
+                        <div className="flex items-center space-x-2">
+                          {request.status === 'completed' && (
+                            <button
+                              onClick={() => handleRevokeClaim(request)}
+                              className="flex items-center space-x-2 px-3 py-2 bg-gradient-to-r from-red-600 to-pink-600 rounded-lg text-white text-sm hover:from-red-500 hover:to-pink-500 transition-all"
+                              title="Revoke this claim and restore original name"
+                            >
+                              <RotateCcw size={14} />
+                              <span>Revoke</span>
+                            </button>
+                          )}
                           <button
-                            onClick={() => handleRevokeClaim(request)}
-                            className="flex items-center space-x-2 px-3 py-2 bg-gradient-to-r from-red-600 to-pink-600 rounded-lg text-white text-sm hover:from-red-500 hover:to-pink-500 transition-all"
+                            onClick={() => {
+                              if (!claimHistories[request.id]) {
+                                fetchClaimHistory(request.id);
+                              }
+                            }}
+                            className="flex items-center space-x-2 px-3 py-2 bg-gradient-to-r from-purple-600 to-blue-600 rounded-lg text-white text-sm hover:from-purple-500 hover:to-blue-500 transition-all"
+                            title="View undo history"
                           >
-                            <RotateCcw size={14} />
-                            <span>Revoke</span>
+                            <Undo size={14} />
+                            <span>Undo History</span>
                           </button>
-                        )}
+                        </div>
+                      )}
                     </div>
                   </div>
+
+                  {claimHistories[request.id] && (
+                    <div className="mt-4 border-t border-slate-700 pt-4">
+                      <h4 className="text-sm font-semibold text-cyan-400 mb-3 flex items-center">
+                        <Undo size={16} className="mr-2" />
+                        Action History
+                      </h4>
+                      {loadingHistory[request.id] ? (
+                        <div className="text-sm text-slate-400">Loading history...</div>
+                      ) : claimHistories[request.id].length === 0 ? (
+                        <div className="text-sm text-slate-400">No history records found</div>
+                      ) : (
+                        <div className="space-y-2">
+                          {claimHistories[request.id].map((history) => (
+                            <div
+                              key={history.id}
+                              className="flex items-center justify-between bg-slate-800/30 border border-slate-700 rounded-lg p-3"
+                            >
+                              <div className="flex-1">
+                                <div className="flex items-center space-x-2">
+                                  <span className={`text-xs font-medium px-2 py-1 rounded ${
+                                    history.action_type === 'claim' ? 'bg-green-500/20 text-green-400' :
+                                    history.action_type === 'revoke' ? 'bg-red-500/20 text-red-400' :
+                                    history.action_type.startsWith('undo_') ? 'bg-purple-500/20 text-purple-400' :
+                                    'bg-slate-500/20 text-slate-400'
+                                  }`}>
+                                    {history.action_type.toUpperCase()}
+                                  </span>
+                                  <span className="text-sm text-slate-300">
+                                    {new Date(history.performed_at).toLocaleString()}
+                                  </span>
+                                </div>
+                                {history.previous_state && (
+                                  <div className="text-xs text-slate-400 mt-1">
+                                    {history.action_type === 'claim' && (
+                                      <span>
+                                        Merged: {history.previous_state.original_player_name} → {history.previous_state.new_player_name}
+                                      </span>
+                                    )}
+                                    {history.action_type === 'revoke' && (
+                                      <span>
+                                        Restored: {history.previous_state.requesting_username} → {history.previous_state.original_player_name}
+                                      </span>
+                                    )}
+                                    {history.action_type.startsWith('undo_') && (
+                                      <span>Undid previous {history.action_type.replace('undo_', '')} action</span>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                              {history.can_undo && (
+                                <button
+                                  onClick={() => handleUndoAction(history.id, history.action_type, request.id)}
+                                  className="flex items-center space-x-1 px-3 py-1 bg-gradient-to-r from-orange-600 to-yellow-600 rounded text-white text-xs hover:from-orange-500 hover:to-yellow-500 transition-all"
+                                  title="Undo this action"
+                                >
+                                  <Undo size={12} />
+                                  <span>Undo</span>
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
           </div>
